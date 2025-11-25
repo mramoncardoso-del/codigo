@@ -1,0 +1,293 @@
+# rob_bolsa.py
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import ta
+from datetime import datetime, timedelta
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+class RoboTimingOportunidades:
+    def _init_(self):
+        self.melhores_acoes = []
+        self.historico_sinais = []
+        
+    def calcular_indicadores(self, dados):
+        """Calcula todos os indicadores técnicos"""
+        # Médias Móveis
+        dados['SMA_20'] = ta.trend.sma_indicator(dados['Close'], window=20)
+        dados['SMA_50'] = ta.trend.sma_indicator(dados['Close'], window=50)
+        dados['EMA_12'] = ta.trend.ema_indicator(dados['Close'], window=12)
+        
+        # MACD
+        macd = ta.trend.MACD(dados['Close'])
+        dados['MACD'] = macd.macd()
+        dados['MACD_Signal'] = macd.macd_signal()
+        
+        # RSI
+        dados['RSI'] = ta.momentum.rsi(dados['Close'], window=14)
+        
+        # Bollinger Bands
+        bollinger = ta.volatility.BollingerBands(dados['Close'])
+        dados['BB_Upper'] = bollinger.bollinger_hband()
+        dados['BB_Lower'] = bollinger.bollinger_lband()
+        
+        # Volume
+        dados['Volume_MA'] = dados['Volume'].rolling(5).mean()
+        dados['Volume_Spike'] = dados['Volume'] > dados['Volume_MA'] * 1.5
+        
+        return dados
+
+    def analisar_tendencia(self, dados):
+        """Análise simplificada de tendência"""
+        ultimo = dados.iloc[-1]
+        
+        pontos = 0
+        if ultimo['Close'] > ultimo['SMA_20']: pontos += 1
+        if ultimo['MACD'] > ultimo['MACD_Signal']: pontos += 1
+        if ultimo['RSI'] > 50: pontos += 0.5
+        
+        if pontos >= 2:
+            tendencia = "ALTA"
+        elif pontos >= 1:
+            tendencia = "ALTA_MODERADA"
+        elif pontos >= 0:
+            tendencia = "NEUTRA"
+        else:
+            tendencia = "BAIXA"
+        
+        return {'tendencia': tendencia, 'pontos': pontos}
+
+    def analisar_timing_entrada(self, dados):
+        """Analisa o timing ideal para entrada com 1 minuto de antecedência"""
+        
+        # Padrões de candles para timing preciso
+        dados['Alta_Forte'] = dados['Close'] > dados['Open'] * 1.01
+        dados['Baixa_Forte'] = dados['Close'] < dados['Open'] * 0.99
+        dados['Sombra_Inferior'] = (dados['Low'] / dados['Close'] - 1) * 100
+        
+        # Indicadores de momentum para timing
+        dados['RSI_5'] = ta.momentum.rsi(dados['Close'], window=5)
+        dados['Stochastic'] = ta.momentum.stochosc(dados['High'], dados['Low'], dados['Close'])
+        dados['Williams_R'] = ta.momentum.williams_r(dados['High'], dados['Low'], dados['Close'])
+        
+        # Volume analysis
+        dados['Volume_MA'] = dados['Volume'].rolling(5).mean()
+        dados['Volume_Spike'] = dados['Volume'] > dados['Volume_MA'] * 1.5
+        
+        return dados
+
+    def prever_momento_entrada(self, dados, ticker):
+        """Prevê o melhor momento para entrada com 1 minuto de antecedência"""
+        
+        ultimo = dados.iloc[-1]
+        penultimo = dados.iloc[-2] if len(dados) > 1 else ultimo
+        
+        sinais_entrada = []
+        confianca = 0
+        timing = "AGUARDAR"
+        
+        # 1. Sinal de Reversão de Baixa (COMPRA)
+        if (ultimo['Baixa_Forte'] and 
+            ultimo['RSI_5'] < 30 and 
+            ultimo['Volume_Spike'] and
+            ultimo['Sombra_Inferior'] < -2):
+            
+            sinais_entrada.append("🔴 POSSÍVEL REVERSÃO - Considerar COMPRA em 1min")
+            confianca += 2
+            timing = "COMPRA_URGENTE"
+        
+        # 2. Sinal de Continuação de Alta (COMPRA)
+        elif (ultimo['Alta_Forte'] and 
+              penultimo['Alta_Forte'] and
+              ultimo['Volume_Spike'] and
+              ultimo['RSI_5'] < 70):
+            
+            sinais_entrada.append("🟢 FORTE ALTA - COMPRA em 1min")
+            confianca += 1.5
+            timing = "COMPRA"
+        
+        # 3. Sinal de Topo (VENDA)
+        elif (ultimo['Alta_Forte'] and 
+              ultimo['RSI_5'] > 85 and
+              ultimo['Volume_Spike']):
+            
+            sinais_entrada.append("🟡 POSSÍVEL TOPO - Considerar VENDA em 1min")
+            confianca -= 1.5
+            timing = "VENDA"
+        
+        # 4. Sinal de Queda (VENDA)
+        elif (ultimo['Baixa_Forte'] and 
+              penultimo['Baixa_Forte'] and
+              ultimo['RSI_5'] > 20):
+            
+            sinais_entrada.append("🔵 FORTE BAIXA - VENDA em 1min")
+            confianca -= 2
+            timing = "VENDA_URGENTE"
+        
+        return {
+            'ticker': ticker,
+            'timing': timing,
+            'confianca': confianca,
+            'sinais': sinais_entrada,
+            'preco_atual': ultimo['Close'],
+            'hora_analise': datetime.now().strftime("%H:%M:%S")
+        }
+
+    def calcular_score_oportunidade(self, dados, ticker):
+        """Calcula score de oportunidade para ranking"""
+        
+        ultimo = dados.iloc[-1]
+        score = 0
+        
+        # Critérios para COMPRA
+        if ultimo['RSI'] < 40: score += 2
+        if ultimo['Close'] > ultimo['SMA_20']: score += 1
+        if ultimo['MACD'] > ultimo['MACD_Signal']: score += 1.5
+        if ultimo['Close'] < ultimo['BB_Lower']: score += 2  # Sobrevendido
+        if ultimo['Volume_Spike']: score += 1
+        
+        # Critérios para VENDA
+        if ultimo['RSI'] > 70: score -= 2
+        if ultimo['Close'] < ultimo['SMA_20']: score -= 1
+        if ultimo['MACD'] < ultimo['MACD_Signal']: score -= 1.5
+        if ultimo['Close'] > ultimo['BB_Upper']: score -= 2  # Sobrecomprado
+        
+        return score
+
+    def rankear_melhores_acoes(self, lista_acoes, top_n=10):
+        """Rankea as melhores ações para compra no momento"""
+        
+        print(f"\n🏆 ANALISANDO MELHORES OPORTUNIDADES - TOP {top_n}")
+        print("=" * 60)
+        
+        oportunidades = []
+        
+        for ticker in lista_acoes:
+            try:
+                # Baixar dados em tempo real (últimos 30 dias)
+                dados = yf.download(ticker, period="1mo", interval="15m")
+                
+                if len(dados) < 20:
+                    continue
+                    
+                # Calcular indicadores
+                dados = self.calcular_indicadores(dados)
+                dados = self.analisar_timing_entrada(dados)
+                
+                # Analisar tendência
+                analise_tendencia = self.analisar_tendencia(dados)
+                
+                # Analisar timing
+                analise_timing = self.prever_momento_entrada(dados, ticker)
+                
+                # Calcular score
+                score = self.calcular_score_oportunidade(dados, ticker)
+                
+                oportunidades.append({
+                    'ticker': ticker,
+                    'score': score,
+                    'preco': dados['Close'].iloc[-1],
+                    'tendencia': analise_tendencia['tendencia'],
+                    'timing': analise_timing['timing'],
+                    'confianca': analise_timing['confianca'],
+                    'sinais': analise_timing['sinais']
+                })
+                
+                print(f"✅ {ticker} analisado")
+                
+                # Pequena pausa para não sobrecarregar API
+                time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"❌ Erro ao analisar {ticker}: {e}")
+                continue
+        
+        # Ordenar por melhor score (maior primeiro)
+        oportunidades.sort(key=lambda x: x['score'], reverse=True)
+        
+        return oportunidades[:top_n]
+
+    def monitorar_oportunidades_em_tempo_real(self, lista_acoes, intervalo=60):
+        """Monitora oportunidades em tempo real"""
+        
+        print("🚀 INICIANDO MONITORAMENTO EM TEMPO REAL")
+        print("Pressione Ctrl+C para parar")
+        print("=" * 50)
+        
+        try:
+            while True:
+                agora = datetime.now().strftime("%H:%M:%S")
+                print(f"\n📊 Atualização: {agora}")
+                
+                # Buscar melhores oportunidades
+                melhores = self.rankear_melhores_acoes(lista_acoes, top_n=5)
+                
+                # Exibir alertas urgentes
+                alertas_urgentes = [op for op in melhores if op['timing'] in ['COMPRA_URGENTE', 'VENDA_URGENTE']]
+                
+                if alertas_urgentes:
+                    print(f"\n🚨 ALERTAS URGENTES ({len(alertas_urgentes)})")
+                    for alerta in alertas_urgentes:
+                        print(f"   {alerta['ticker']} - {alerta['timing']} - R$ {alerta['preco']:.2f}")
+                
+                # Aguardar próximo ciclo
+                print(f"⏰ Próxima análise em {intervalo} segundos...")
+                time.sleep(intervalo)
+                
+        except KeyboardInterrupt:
+            print("\n⏹️ Monitoramento interrompido pelo usuário")
+
+# EXEMPLO PRÁTICO DE USO
+if _name_ == "_main_":
+    
+    # Lista de ações para monitorar (IBOVESPA principais)
+    carteira_ibov = [
+        "PETR4.SA", "VALE3.SA", "ITUB4.SA", "BBDC4.SA", "WEGE3.SA",
+        "B3SA3.SA", "ABEV3.SA", "BBAS3.SA", "SANB11.SA", "EQTL3.SA"
+    ]
+    
+    # Inicializar robô
+    robo = RoboTimingOportunidades()
+    
+    print("🤖 ROBÔ DE TIMING E OPORTUNIDADES - BOLSA DE VALORES")
+    print("=" * 60)
+    
+    # 1. Ranking das melhores oportunidades atuais
+    melhores_oportunidades = robo.rankear_melhores_acoes(carteira_ibov, top_n=5)
+    
+    print(f"\n🏅 TOP 5 MELHORES OPORTUNIDADES AGORA:")
+    print("=" * 50)
+    
+    for i, op in enumerate(melhores_oportunidades, 1):
+        print(f"\n{i}º 🎯 {op['ticker']}")
+        print(f"   💰 Preço: R$ {op['preco']:.2f}")
+        print(f"   📈 Tendência: {op['tendencia']}")
+        print(f"   ⏰ Timing: {op['timing']}")
+        print(f"   🎯 Score: {op['score']:.2f}")
+        print(f"   🔍 Confiança: {op['confianca']:.1f}")
+        
+        if op['sinais']:
+            for sinal in op['sinais']:
+                print(f"   💡 {sinal}")
+    
+    # 2. Identificar recomendações específicas
+    compras_recomendadas = [op for op in melhores_oportunidades if op['timing'].startswith('COMPRA')]
+    vendas_recomendadas = [op for op in melhores_oportunidades if op['timing'].startswith('VENDA')]
+    
+    print(f"\n🎯 RESUMO DAS RECOMENDAÇÕES:")
+    print("=" * 40)
+    print(f"🟢 COMPRAS RECOMENDADAS: {len(compras_recomendadas)}")
+    for compra in compras_recomendadas[:3]:
+        print(f"   • {compra['ticker']} - R$ {compra['preco']:.2f} (Score: {compra['score']:.1f})")
+    
+    print(f"🔴 VENDAS RECOMENDADAS: {len(vendas_recomendadas)}")
+    for venda in vendas_recomendadas[:3]:
+        print(f"   • {venda['ticker']} - R$ {venda['preco']:.2f} (Score: {venda['score']:.1f})")
+    
+    # 3. Iniciar monitoramento contínuo (opcional)
+    resposta = input("\n📱 Deseja iniciar monitoramento em tempo real? (s/n): ")
+    if resposta.lower() == 's':
+        print("🚀 Iniciando monitoramento... (Intervalo: 5 minutos)")
+        robo.monitorar_oportunidades_em_tempo_real(carteira_ibov, intervalo=300)
